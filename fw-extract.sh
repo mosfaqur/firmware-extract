@@ -21,6 +21,13 @@
 #   - hardening census over all ELF binaries (canary/PIE/NX/RELRO) plus
 #     an unsafe-function import census from the dynamic symbol table as
 #     a lightweight complement to per-binary strings counts
+#   - extended binary census: static/dynamic linkage, stripped/unstripped,
+#     FORTIFY_SOURCE (_chk imports), RELRO full/partial/none and a
+#     per-architecture breakdown
+#   - per-binary embedded-secret scan (private-key headers, certificates,
+#     credential assignments, URLs, host:port) attributed to each ELF
+#   - component version fingerprinting (OpenSSL, glibc, BusyBox, curl,
+#     uhttpd, dropbear, strongSwan, OpenSSH, tcpdump)
 #   - machine-readable output: $OUTDIR/findings.json + items.tsv
 #
 # usage: ./fw-extract.sh <firmware_file|extracted_dir> [output_dir]
@@ -32,6 +39,8 @@
 #                          (stage 4 is skipped unless this is set)
 #   HASH_TIMEOUT=<seconds> per-hashcat-run time budget (default 3600)
 #   NO_HASHCAT=1           disable stage 4 cracking even if wordlist set
+#   BIN_SCAN_LIMIT=<n>     top-N (largest) ELF binaries to scan for
+#                          embedded secrets/versions (default 200)
 #
 # deps: binwalk, unsquashfs/sasquatch, strings, openssl, file, find,
 #       grep, readelf, numfmt (optional: hashcat, python3)
@@ -51,11 +60,12 @@ set -uo pipefail
 shopt -s nullglob
 
 declare -r SCRIPT_NAME="fw-extract.sh"
-declare -r VERSION="2.0.0"
+declare -r VERSION="2.1.0"
 
 HASH_WORDLIST="${HASH_WORDLIST:-}"
 HASH_TIMEOUT="${HASH_TIMEOUT:-3600}"
 NO_HASHCAT="${NO_HASHCAT:-0}"
+BIN_SCAN_LIMIT="${BIN_SCAN_LIMIT:-200}"
 
 export LC_ALL=C
 
@@ -646,29 +656,89 @@ stage2_network() {
 
 UNSAFE_FUNCS=(system popen execve strcpy strcat sprintf gets)
 
+# normalise the readelf "Machine:" field to a short arch label
+arch_short() {
+    local m="$1"
+    case "$m" in
+        *MIPS*)         echo "MIPS" ;;
+        *AArch64*)      echo "aarch64" ;;
+        *ARM*)          echo "ARM" ;;
+        *X86-64*|*x86-64*) echo "x86-64" ;;
+        *80386*)        echo "x86" ;;
+        *RISC-V*)       echo "RISC-V" ;;
+        *PowerPC64*)    echo "PowerPC64" ;;
+        *PowerPC*)      echo "PowerPC" ;;
+        *)              echo "other" ;;
+    esac
+}
+
+# relro classification: none | partial | full   ($1 = readelf -l, $2 = readelf -d)
+relro_state() {
+    case "$1" in *GNU_RELRO*)
+        case "$2" in *BIND_NOW*) echo "full" ;; *) echo "partial" ;; esac ;;
+    *) echo "none" ;; esac
+}
+
 stage5_binaries() {
     local bin arch f c missing line imp tok flag
+    local rp mline relro hdr size linkage stripped symimports fort ph dy
     section "Binaries"
 
     # --- hardening + import census over every (unique) ELF binary ---
     log "hardening census over all ELF binaries..."
     N_ELF=0; N_WEAK=0; N_UNSAFE=0
+    N_STATIC=0; N_UNSTRIP=0; N_FORT=0
+    N_RELFULL=0; N_RELPART=0; N_RELNONE=0
     declare -A UFN_IMPORTS=()
+    declare -A ARCH_TOT ARCH_WEAK ARCH_UNSAFE ARCH_FORT \
+              ARCH_STATIC ARCH_UNSTRIP ARCH_NORELRO
     local census_db="$OUTDIR/.seen_census"
     : > "$census_db"
+    : > "$CENSUS_TSV"
     while IFS= read -r -d '' bin; do
         file -b "$bin" 2>/dev/null | grep -q "ELF" || continue
         seen_db "$census_db" "$bin" && continue
+        rp="${bin#"$ROOTFS/"}"
         N_ELF=$((N_ELF + 1))
+
+        hdr=$(readelf -h "$bin" 2>/dev/null)
+        mline=$(printf '%s\n' "$hdr" | grep -i "Machine:" | head -1)
+        arch=$(arch_short "$mline")
+        ph=$(readelf -l "$bin" 2>/dev/null)
+        dy=$(readelf -d "$bin" 2>/dev/null)
+
+        # linkage: has a dynamic section -> dynamic, else static
+        [[ -n "$dy" ]] && linkage="dynamic" || linkage="static"
+
+        # stripped? rely on section/symbol presence rather than file(1) wording
+        if readelf -S "$bin" 2>/dev/null | grep -qE '\.symtab'; then
+            stripped="no"
+            N_UNSTRIP=$((N_UNSTRIP + 1))
+        else
+            stripped="yes"
+        fi
+
         missing=""
         readelf -s "$bin" 2>/dev/null | grep -q "__stack_chk_fail" || missing+="NO_CANARY "
-        readelf -h "$bin" 2>/dev/null | grep -q "DYN" || missing+="NO_PIE "
-        readelf -l "$bin" 2>/dev/null | grep -qE "GNU_STACK.* RW " || missing+="NO_NX "
-        readelf -l "$bin" 2>/dev/null | grep -q "GNU_RELRO" || missing+="NO_RELRO "
+        printf '%s\n' "$hdr" | grep -q "DYN" || missing+="NO_PIE "
+        printf '%s\n' "$ph" | grep -qE "GNU_STACK.* RW " || missing+="NO_NX "
+        relro=$(relro_state "$ph" "$dy")
+        case "$relro" in
+            full)    N_RELFULL=$((N_RELFULL + 1)) ;;
+            partial) N_RELPART=$((N_RELPART + 1)) ;;
+            none)    N_RELNONE=$((N_RELNONE + 1)); missing+="NO_RELRO " ;;
+        esac
         [[ -n "$missing" ]] && N_WEAK=$((N_WEAK + 1))
+        [[ "$linkage" == "static" ]] && N_STATIC=$((N_STATIC + 1))
+
+        symimports=$(readelf -Ws "$bin" 2>/dev/null | grep -a "UND")
+        # FORTIFY_SOURCE: any *_chk import
+        fort="no"
+        if printf '%s\n' "$symimports" | grep -aqE '_chk(@|$)'; then
+            fort="yes"; N_FORT=$((N_FORT + 1))
+        fi
         # unsafe-function imports via the dynamic symbol table
-        imp=$(readelf -Ws "$bin" 2>/dev/null | grep -aE "FUNC|OBJECT" | \
-            grep -a "UND" | \
+        imp=$(printf '%s\n' "$symimports" | grep -aE "FUNC|OBJECT" | \
             grep -aoE '(system|popen|execve|strcpy|strcat|sprintf|gets)(@[A-Za-z0-9_.]+)?' \
             | sort -u)
         flag=0
@@ -681,14 +751,47 @@ stage5_binaries() {
             flag=1
         done
         [[ "$flag" -eq 1 ]] && N_UNSAFE=$((N_UNSAFE + 1))
+
+        # per-arch aggregates
+        ARCH_TOT[$arch]=$(( ${ARCH_TOT[$arch]:-0} + 1 ))
+        [[ -n "$missing" ]] && ARCH_WEAK[$arch]=$(( ${ARCH_WEAK[$arch]:-0} + 1 ))
+        [[ "$flag" -eq 1 ]] && ARCH_UNSAFE[$arch]=$(( ${ARCH_UNSAFE[$arch]:-0} + 1 ))
+        [[ "$fort" == "yes" ]] && ARCH_FORT[$arch]=$(( ${ARCH_FORT[$arch]:-0} + 1 ))
+        [[ "$linkage" == "static" ]] && ARCH_STATIC[$arch]=$(( ${ARCH_STATIC[$arch]:-0} + 1 ))
+        [[ "$stripped" == "no" ]] && ARCH_UNSTRIP[$arch]=$(( ${ARCH_UNSTRIP[$arch]:-0} + 1 ))
+        [[ "$relro" == "none" ]] && ARCH_NORELRO[$arch]=$(( ${ARCH_NORELRO[$arch]:-0} + 1 ))
+
+        size=$(stat -c%s "$bin" 2>/dev/null || stat -f%z "$bin" 2>/dev/null)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$relro" "$size" "$arch" "$linkage" "$stripped" "$fort" \
+            "$([[ -n "$missing" ]] && echo 1 || echo 0)" \
+            "$([[ "$flag" -eq 1 ]] && echo 1 || echo 0)" \
+            "$([[ "$stripped" == "no" ]] && echo 1 || echo 0)" \
+            "$([[ "$linkage" == "static" ]] && echo 1 || echo 0)" \
+            "$bin" >> "$CENSUS_TSV"
     done < <(find "$ROOTFS" -type f -executable -print0 2>/dev/null)
 
-    log "census: $N_ELF ELF binaries; $N_WEAK missing >=1 hardening control; $N_UNSAFE import unsafe fns"
+    log "census: $N_ELF ELF; $N_WEAK weak; $N_UNSAFE unsafe-import; $N_FORT fortify"
     rpt "" "- analysed ELF binaries: $N_ELF"
     rpt "- ELF binaries missing >=1 hardening control: $N_WEAK"
     rpt "- ELF binaries importing an unsafe function: $N_UNSAFE"
     for f in $(printf '%s\n' "${!UFN_IMPORTS[@]}" | sort); do
         rpt "  - $f(): ${UFN_IMPORTS[$f]} binaries"
+    done
+    rpt ""
+    rpt "- statically linked ELF binaries: $N_STATIC"
+    rpt "- unstripped ELF binaries (debug syms): $N_UNSTRIP"
+    rpt "- ELF binaries using FORTIFY_SOURCE (_chk): $N_FORT"
+    rpt "- RELRO full: $N_RELFULL | partial: $N_RELPART | none: $N_RELNONE"
+    rpt ""
+    rpt "### Architecture breakdown"
+    for arch in $(printf '%s\n' "${!ARCH_TOT[@]}" | sort); do
+        local aline
+        aline="- $arch: ${ARCH_TOT[$arch]} binaries (weak ${ARCH_WEAK[$arch]:-0}, "
+        aline+="unsafe-import ${ARCH_UNSAFE[$arch]:-0}, fortify ${ARCH_FORT[$arch]:-0}, "
+        aline+="static ${ARCH_STATIC[$arch]:-0}, unstripped ${ARCH_UNSTRIP[$arch]:-0}, "
+        aline+="no-RELRO ${ARCH_NORELRO[$arch]:-0})"
+        rpt "$aline"
     done
 
     # --- per-binary strings counts (methodology unchanged from v1) ---
@@ -706,15 +809,128 @@ stage5_binaries() {
         done
         [[ -z "$dangerous" ]] && continue
         log "  ${bin##*/} [$arch]: $dangerous"
+        ph=$(readelf -l "$bin" 2>/dev/null)
+        dy=$(readelf -d "$bin" 2>/dev/null)
+        relro=$(relro_state "$ph" "$dy")
+        if readelf -Ws "$bin" 2>/dev/null | grep -aqE '_chk(@|$)'; then
+            fort="yes"
+        else
+            fort="no"
+        fi
         missing=""
         readelf -s "$bin" 2>/dev/null | grep -q "__stack_chk_fail" || missing+="NO_CANARY "
         readelf -h "$bin" 2>/dev/null | grep -q "DYN" || missing+="NO_PIE "
-        readelf -l "$bin" 2>/dev/null | grep -qE "GNU_STACK.* RW " || missing+="NO_NX "
+        printf '%s\n' "$ph" | grep -qE "GNU_STACK.* RW " || missing+="NO_NX "
+        [[ "$relro" == "none" ]] && missing+="NO_RELRO "
         line="- \`${bin##*/}\` [$arch]: $dangerous"
         [[ -n "$missing" ]] && line+=" | missing: $missing"
+        line+=" | RELRO: $relro | FORTIFY: $fort"
         rpt "$line"
-        note "unsafe_binary" medium "$bin" "$dangerous${missing:+ missing: $missing}"
+        note "unsafe_binary" medium "$bin" "$dangerous${missing:+ missing: $missing} RELRO:$relro FORTIFY:$fort"
     done < <(find "$ROOTFS" -type f -executable -print0 2>/dev/null | head -z -n 200)
+    rpt ""
+}
+
+# ---------------------------------------------------------------------------
+# stage 5 (continued): embedded-secret scan + component version fingerprint
+# on the largest unique ELF binaries (attribution to specific binaries).
+# ---------------------------------------------------------------------------
+
+stage5_binary_insight() {
+    local limit rows tmp size path stro
+    local n_pk n_cert n_cred n_url n_hp total rel line detail
+    local ver_list v
+    rpt "" "### Embedded secrets and component versions in binaries"
+
+    [[ -s "$CENSUS_TSV" ]] || { rpt "- no ELF binaries to scan"; return; }
+    log "scanning top-$BIN_SCAN_LIMIT ELF binaries for embedded secrets/versions..."
+    limit="$BIN_SCAN_LIMIT"
+    tmp="$OUTDIR/.secret_rows"
+    : > "$tmp"
+    : > "$OUTDIR/component_rows"
+
+    # census rows: relro TAB size TAB arch TAB ... TAB path ; largest first
+    mapfile -t rows < <(sort -s -t $'\t' -k2,2 -nr "$CENSUS_TSV" | head -n "$limit")
+    for line in "${rows[@]:-}"; do
+        [[ -n "$line" ]] || continue
+        size=${line#*$'\t'}; size=${size%%$'\t'*}
+        path=${line##*$'\t'}
+        [[ -r "$path" ]] || continue
+        # skip pathological sizes
+        if [[ "${size:-0}" -gt 300000000 ]]; then continue; fi
+
+        stro=$(strings -a -n 6 "$path" 2>/dev/null)
+
+        n_pk=$(printf '%s\n' "$stro" | grep -acE 'BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY' 2>/dev/null || true); n_pk=${n_pk:-0}
+        n_cert=$(printf '%s\n' "$stro" | grep -acE 'BEGIN CERTIFICATE' 2>/dev/null || true); n_cert=${n_cert:-0}
+        n_cred=$(printf '%s\n' "$stro" | grep -acEi '(password|passwd|secret|token|api[_-]?key|psk)[[:space:]]*[:=][[:space:]]*["'\''A-Za-z0-9]' 2>/dev/null || true); n_cred=${n_cred:-0}
+        n_url=$(printf '%s\n' "$stro" | grep -acE 'https?://' 2>/dev/null || true); n_url=${n_url:-0}
+        n_hp=$(printf '%s\n' "$stro" | grep -acE '\b([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}\b' 2>/dev/null || true); n_hp=${n_hp:-0}
+
+        total=$((n_pk + n_cert + n_cred + n_url + n_hp))
+        if [[ "$total" -gt 0 ]]; then
+            N_BIN_SECRET=$((N_BIN_SECRET + 1))
+            example=$(printf '%s\n' "$stro" | grep -aE 'BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|BEGIN CERTIFICATE' | head -1)
+            [[ -z "$example" ]] && example=$(printf '%s\n' "$stro" | grep -aEi '(password|secret|token|api[_-]?key|psk)[[:space:]]*[:=]' | head -1)
+            [[ -z "$example" ]] && example=$(printf '%s\n' "$stro" | grep -aE 'https?://' | head -1)
+            rel="${path#"$ROOTFS/"}"
+            printf '%s\t%s\tpk=%s cert=%s cred=%s url=%s hostport=%s\t%s\n' \
+                "$total" "$rel" "$n_pk" "$n_cert" "$n_cred" "$n_url" "$n_hp" \
+                "${example:0:90}" >> "$tmp"
+            if [[ "$n_pk" -gt 0 || "$n_cert" -gt 0 ]]; then
+                note "embedded_secret" high "$path" \
+                    "embedded key/cert headers (pk=$n_pk cert=$n_cert)"
+            elif [[ "$n_cred" -ge 5 ]]; then
+                note "embedded_secret" medium "$path" "embedded credential strings"
+            fi
+        fi
+
+        # component version fingerprint (match the version token itself)
+        ver_list=""
+        v=$(printf '%s\n' "$stro" | grep -aoE 'OpenSSL[ /][0-9]+(\.[0-9]+){1,3}[a-z]?' 2>/dev/null | head -1);        [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'GNU C Library[^\n]{0,80}version [0-9]+(\.[0-9]+)+' 2>/dev/null | head -1); [[ -n "$v" ]] && ver_list+="glibc ${v##*version }; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'BusyBox v[0-9]+\.[0-9]+(\.[0-9]+)?' 2>/dev/null | head -1);         [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'libcurl/[0-9]+\.[0-9]+(\.[0-9]+)?' 2>/dev/null | head -1);         [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'uhttpd[ /][0-9]+(\.[0-9]+)?' 2>/dev/null | head -1);               [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'Dropbear SSH server v[0-9]+\.[0-9]+' 2>/dev/null | head -1);        [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE '[Ss]trong[Ss]wan [0-9]+\.[0-9]+' 2>/dev/null | head -1);            [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'OpenSSH[ _][0-9]+\.[0-9]+(p[0-9]+)?' 2>/dev/null | head -1);        [[ -n "$v" ]] && ver_list+="$v; "
+        v=$(printf '%s\n' "$stro" | grep -aoE 'tcpdump version [0-9]+\.[0-9]+' 2>/dev/null | head -1);             [[ -n "$v" ]] && ver_list+="$v; "
+        if [[ -n "$ver_list" ]]; then
+            rel="${path#"$ROOTFS/"}"
+            printf '%s\t%s\n' "$rel" "${ver_list%; }" >> "$OUTDIR/component_rows"
+            N_BIN_VER=$((N_BIN_VER + 1))
+        fi
+    done
+
+    rpt ""
+    rpt "#### Binaries containing embedded secret patterns"
+    rpt ""
+    if [[ -s "$tmp" ]]; then
+        # sort by hit count desc, then path
+        sort -s -t $'\t' -k1,1 -nr -k2,2 "$tmp" | head -n 60 | \
+        while IFS=$'\t' read -r total rel detail; do
+            rpt "- \`$rel\`: $detail"
+        done
+        rpt ""
+        rpt "- ELF binaries with embedded secrets (top ${BIN_SCAN_LIMIT} scanned): $N_BIN_SECRET"
+    else
+        rpt "- no embedded secret strings found in the analysed binaries"
+    fi
+
+    rpt ""
+    rpt "#### Component version fingerprint"
+    rpt ""
+    if [[ -s "$OUTDIR/component_rows" ]]; then
+        sort -s -t $'\t' -k1,1 "$OUTDIR/component_rows" | head -n 40 | \
+        while IFS=$'\t' read -r rel detail; do
+            rpt "- \`$rel\`: $detail"
+        done
+        rpt ""
+        rpt "- ELF binaries with identifiable component versions: $N_BIN_VER"
+    else
+        rpt "- no identifiable component versions found"
+    fi
     rpt ""
 }
 
@@ -999,6 +1215,12 @@ synthesize() {
 | ELF binaries analysed | ${N_ELF:-0} |
 | ELF binaries missing hardening | ${N_WEAK:-0} |
 | ELF binaries importing unsafe fn | ${N_UNSAFE:-0} |
+| statically linked ELF binaries | ${N_STATIC:-0} |
+| unstripped ELF binaries | ${N_UNSTRIP:-0} |
+| ELF binaries with FORTIFY | ${N_FORT:-0} |
+| ELF binaries with no RELRO | ${N_RELNONE:-0} |
+| ELF binaries with embedded secrets | ${N_BIN_SECRET:-0} |
+| ELF binaries with known component ver | ${N_BIN_VER:-0} |
 | debug consoles/services referenced | ${N_CONSOLE:-0} |
 | extracted files | ${FILE_COUNT:-0} |
 | strings indexed | ${STR_COUNT:-0} |
@@ -1039,7 +1261,7 @@ if head != -1:
                 summary[cells[0]] = int(cells[1])
 
 doc = {
-    "tool": {"name": "fw-extract.sh", "version": "2.0.0"},
+    "tool": {"name": "fw-extract.sh", "version": "2.1.0"},
     "firmware": {"file": os.environ.get("FW_NAME", ""),
                  "size_bytes": int(os.environ.get("FW_SIZE", "0") or 0)},
     "output_dir": os.environ.get("OUTDIR", ""),
@@ -1078,6 +1300,7 @@ main() {
     STRINGS_DUMP="$OUTDIR/all_strings.txt"
     ITEMS="$OUTDIR/items.tsv"
     SEEN="$OUTDIR/.seen"
+    CENSUS_TSV="$OUTDIR/census.tsv"
 
     mkdir -p "$OUTDIR" "$EXTRACT" "$FINDINGS"/{keys,certs,configs,credentials,hashes}
     : > "$SEEN"
@@ -1117,6 +1340,9 @@ EOF
     # counters referenced across stages / summary
     HASH_CRACKED=0; PRIV_PLAIN=0; PRIV_ENC=0; PUB_KEYS=0
     N_ELF=0; N_WEAK=0; N_UNSAFE=0; N_CONSOLE=0; N_LISTENER=0
+    N_STATIC=0; N_UNSTRIP=0; N_FORT=0
+    N_RELFULL=0; N_RELPART=0; N_RELNONE=0
+    N_BIN_SECRET=0; N_BIN_VER=0
     FILE_COUNT=0; STR_COUNT=0
     MIME="directory/scan-only"
 
@@ -1130,6 +1356,7 @@ EOF
     stage2_creds
     stage2_network
     stage5_binaries
+    stage5_binary_insight
     stage2_startup
     stage6_debug
     stage5_web

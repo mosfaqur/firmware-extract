@@ -5,10 +5,10 @@ artifacts from embedded Linux firmware images: **credentials, cryptographic key
 material, password hashes, unsafe binary functions and debug interfaces**.
 
 `fw-extract.sh` was developed as the operational tooling for a study of detection
-coverage across these five sensitive-material categories in production firmware
-(a pilot on an Alcatel-Lucent Askey 9361 femtocell image, extended in the full
-study to ARM64 images). The script automates a seven-stage research design and
-produces measurable, reproducible outputs from a single command.
+coverage across these five sensitive-material categories in production firmware.
+The pipeline was validated on production embedded-Linux images, with the
+accompanying research extending the design across ARM64 production firmware
+images.
 
 ## Features
 
@@ -25,9 +25,18 @@ produces measurable, reproducible outputs from a single command.
   (`$1$`, `$5$`, `$6$`, `$2a/b/y$`, unsalted MD5/SHA1) and a time-bounded
   `hashcat` dictionary run with a per-account recovery report.
 - **Binary analysis** — hardening census over every ELF binary
-  (canary / PIE / NX / RELRO) plus an unsafe-function import census from the
-  dynamic symbol table, alongside per-binary `strings` counts of
-  `system, popen, execve, strcpy, strcat, sprintf, gets`.
+  (canary / PIE / NX / RELRO depth full·partial·none) plus an unsafe-function
+  import census from the dynamic symbol table, alongside per-binary `strings`
+  counts of `system, popen, execve, strcpy, strcat, sprintf, gets`.
+  Extended binary metrics: static vs dynamic linkage, stripped vs unstripped,
+  FORTIFY_SOURCE (`_chk` imports), and a per-architecture breakdown.
+- **Embedded-secret attribution** — scans the largest ELF binaries for embedded
+  private-key headers, certificates, credential assignments, URLs and
+  host:port strings, and reports which specific binary contains them (e.g.
+  management credentials compiled into an application partition binary).
+- **Component version fingerprinting** — detects OpenSSL, glibc, BusyBox,
+  libcurl, uhttpd, dropbear, strongSwan, OpenSSH and tcpdump version strings
+  inside binaries to flag outdated builds (e.g. OpenSSL 0.9.8y, glibc 2.5).
 - **Debug-interface enumeration** — startup scripts, `.profile` and `scripts`
   material checked for `telnet(d)`, `gdbserver`, `dropbear`, `socat`/`nc -l`,
   serial-console and JTAG references, classified as *loopback* or
@@ -49,7 +58,7 @@ produces measurable, reproducible outputs from a single command.
 
 ```sh
 # full pipeline on a firmware archive
-./fw-extract.sh BSR-04.03.70.a.2.aky.tgz out/
+./fw-extract.sh firmware.bin out/
 
 # scan an already-extracted filesystem tree (skips stage 1)
 ./fw-extract.sh /path/to/extracted/ out/
@@ -64,6 +73,8 @@ HASH_TIMEOUT=86400 \
 ./fw-extract.sh firmware.bin out/
 
 NO_HASHCAT=1            # force-disable cracking
+BIN_SCAN_LIMIT=300      # top-N largest ELF binaries for the embedded-secret
+                        # and version scans (default 200)
 ```
 
 ## Outputs
@@ -73,6 +84,7 @@ out/
 ├── REPORT.md           human-readable report (all categories + summary table)
 ├── findings.json       machine-readable taxonomy (summary + typed findings)
 ├── items.tsv           raw findings log
+├── census.tsv          per-ELF metric rows (relro/size/arch/linkage/stripped/fortify)
 ├── all_strings.txt     cross-partition strings index
 ├── hashcat.log/.pot    stage 4 artefacts (when cracking is enabled)
 └── findings/           copied artefacts
