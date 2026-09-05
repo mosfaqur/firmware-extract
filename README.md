@@ -12,15 +12,29 @@ images.
 
 ## Features
 
-- **Multi-partition extraction** — binwalk (recursive, depth 5) + `unsquashfs` /
-  `sasquatch`; also unpacks `cpio` images found inside the archive.
+- **Multi-partition & nested extraction** — binwalk (recursive, depth 5) + `unsquashfs` /
+  `sasquatch`, `cpio`, plus multi-pass recursive extraction of nested `.tgz`, `.tar`,
+  and `.zip` filesystem archives.
+- **Privilege & permissions audit** — SUID (`4000`) and SGID (`2000`) binary census
+  correlated with ELF hardening (canary/PIE/NX), identification of high-risk binaries
+  (e.g. SUID root `busybox`/`su`), and detection of world-writable system files.
+- **Kernel module (.ko) & driver census** — comprehensive driver inventory via
+  `modinfo`, extracting module parameters (hardware/debug overrides), license
+  attribution (GPL vs proprietary), vermagic, authors, and dependencies.
+- **Super-server & network services** — parses `xinetd` and `inetd` configurations,
+  reporting daemons running as root and flagging scripts with dynamic command execution (`eval`/`exec`).
+- **Scheduled tasks & background jobs** — discovers scheduled crontabs and systemd
+  timers running under root.
+- **Plaintext secret stores** — detects dedicated secret files (`/etc/*.secret*`,
+  `pap-secrets`, `chap-secrets`, `.netrc`, `.htpasswd`), shadow backups, and
+  wireless credentials (`wpa_supplicant.conf`, `hostapd.conf`, OpenWrt wireless).
+- **Cryptographic hygiene & key classification** — validates keys with `openssl`
+  (private/encrypted/public), checks x509 certificate expiry/validity, flags weak
+  signature algorithms (MD5/SHA1), weak RSA key lengths (< 2048-bit), and weak
+  Diffie-Hellman parameters (`dhpars.pem`).
 - **Credential scanning** — root-equivalent and blank-password accounts,
   `shadow` hash enumeration, hardcoded-secret regex pass over a cross-partition
-  `strings` index, `sshd_config` and IPsec review.
-- **Key-material classification** — each candidate key is validated with
-  `openssl` and classified as *private (plaintext)*, *private (encrypted)* or
-  *public*, so public keys are no longer miscounted as private keys (the v1
-  defect documented as the §4.2 fix in the accompanying paper).
+  `strings` index (including Google API keys, JWT tokens, WireGuard keys, GitHub tokens).
 - **Password-hash cracking** (optional) — hash format auto-detection
   (`$1$`, `$5$`, `$6$`, `$2a/b/y$`, unsalted MD5/SHA1) and a time-bounded
   `hashcat` dictionary run with a per-account recovery report.
@@ -32,11 +46,12 @@ images.
   FORTIFY_SOURCE (`_chk` imports), and a per-architecture breakdown.
 - **Embedded-secret attribution** — scans the largest ELF binaries for embedded
   private-key headers, certificates, credential assignments, URLs and
-  host:port strings, and reports which specific binary contains them (e.g.
-  management credentials compiled into an application partition binary).
+  host:port strings, and reports which specific binary contains them.
 - **Component version fingerprinting** — detects OpenSSL, glibc, BusyBox,
   libcurl, uhttpd, dropbear, strongSwan, OpenSSH and tcpdump version strings
-  inside binaries to flag outdated builds (e.g. OpenSSL 0.9.8y, glibc 2.5).
+  inside binaries to flag outdated builds.
+- **System hardening & bootloader layout** — parses `/etc/sysctl.conf` (flagging
+  test/lab mode remnants) and U-Boot `fw_env.config` MTD flash partition layouts.
 - **Debug-interface enumeration** — startup scripts, `.profile` and `scripts`
   material checked for `telnet(d)`, `gdbserver`, `dropbear`, `socat`/`nc -l`,
   serial-console and JTAG references, classified as *loopback* or
@@ -51,6 +66,7 @@ images.
 |------|---------|----------|
 | `binwalk`, `unsquashfs`/`sasquatch` | filesystem extraction | yes (skip in scan-only mode) |
 | `strings`, `openssl`, `file`, `find`, `grep`, `readelf` | analysis | yes |
+| `modinfo` | kernel module parameter extraction | optional (falls back to strings) |
 | `hashcat` | stage 4 cracking | optional |
 | `python3` | `findings.json` output | optional |
 
@@ -85,10 +101,11 @@ out/
 ├── findings.json       machine-readable taxonomy (summary + typed findings)
 ├── items.tsv           raw findings log
 ├── census.tsv          per-ELF metric rows (relro/size/arch/linkage/stripped/fortify)
+├── kernel_modules.tsv  kernel module catalog (module/license/vermagic/author/params)
 ├── all_strings.txt     cross-partition strings index
 ├── hashcat.log/.pot    stage 4 artefacts (when cracking is enabled)
 └── findings/           copied artefacts
-    ├── keys/  certs/  configs/  credentials/  hashes/
+    ├── keys/  certs/  configs/  credentials/  hashes/  modules/
 ```
 
 ## Ethical note

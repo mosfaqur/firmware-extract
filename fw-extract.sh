@@ -3,32 +3,32 @@
 # fw-extract.sh - extract and classify security-relevant artifacts from
 #                 embedded Linux firmware images.
 #
-# v2 (enhanced)
-#   - refactored into stage functions; deterministic output ordering
-#   - FIX (paper 4.2): private/public/encrypted key classification using
-#     openssl, reported separately in the Summary (no longer counting
-#     public keys as private keys)
-#   - scan-only mode: pass an already-extracted directory instead of a
-#     firmware archive to skip stage 1
-#   - provenance-preserving copies: findings retain their relative path
-#     instead of being flattened to basename (no silent clobbering when a
-#     firmware contains several rootfs variants sharing file names)
-#   - stage 4 automation: hash format auto-detection + optional
-#     time-bounded hashcat run producing a Table 5.3 style report
-#   - stage 6 debug-interface enumeration: startup scripts and binary
-#     strings checked for telnetd/gdbserver/serial/jtag consoles with
-#     loopback vs 0.0.0.0 exposure classification
-#   - hardening census over all ELF binaries (canary/PIE/NX/RELRO) plus
-#     an unsafe-function import census from the dynamic symbol table as
-#     a lightweight complement to per-binary strings counts
-#   - extended binary census: static/dynamic linkage, stripped/unstripped,
-#     FORTIFY_SOURCE (_chk imports), RELRO full/partial/none and a
-#     per-architecture breakdown
-#   - per-binary embedded-secret scan (private-key headers, certificates,
-#     credential assignments, URLs, host:port) attributed to each ELF
-#   - component version fingerprinting (OpenSSL, glibc, BusyBox, curl,
-#     uhttpd, dropbear, strongSwan, OpenSSH, tcpdump)
-#   - machine-readable output: $OUTDIR/findings.json + items.tsv
+# v2.2 (enhanced)
+#   - SUID/SGID & permission audit: enumerates setuid/setgid binaries,
+#     cross-references with ELF hardening (canary/PIE/NX), flags high-risk
+#     binaries (busybox/su/sh) and identifies world-writable system files
+#   - Kernel modules (.ko) & driver census: catalogs all loadable drivers,
+#     inspects module parameters (debug/hardware test overrides), licenses
+#     (GPL vs proprietary), vermagic, authors, and module dependencies
+#   - Super-server & network services: audits xinetd and inetd configs,
+#     detecting daemons running as root and dynamic command runners (eval/exec)
+#   - Scheduled tasks & background automation: comprehensive crontab and
+#     systemd timer discovery, reporting command targets running under root
+#   - Plaintext secret stores: audits dedicated secret files (/etc/*.secret,
+#     pap-secrets, chap-secrets, .netrc, .htpasswd, shadow backups) and
+#     wireless credentials (wpa_supplicant, hostapd, OpenWrt wireless)
+#   - Cryptographic hygiene & certificate depth: checks x509 validity/expiry,
+#     flags deprecated signature algorithms (MD5/SHA1), weak RSA key lengths
+#     (< 2048-bit), and weak Diffie-Hellman parameters (dhpars.pem)
+#   - Kernel & system hardening (sysctl): audits /etc/sysctl.conf and lab/test
+#     configurations (flags test-mode remnants left in production builds)
+#   - Bootloader & hardware assets: parses U-Boot MTD environment layouts
+#     (fw_env.config) and identifies FPGA bitstreams (.rbf/.bit) and blobs
+#   - Recursive archive unpacking: handles nested rootfs archives (.tgz, .tar,
+#     .zip, .xz, .squashfs) across multi-stage firmware packages
+#   - Extended regex patterns: Google API keys, JWT tokens, WireGuard keys,
+#     and GitHub tokens added to strings credential index
+#   - Provenance-preserving copies, deterministic output, findings.json taxonomy
 #
 # usage: ./fw-extract.sh <firmware_file|extracted_dir> [output_dir]
 #
@@ -43,16 +43,18 @@
 #                          embedded secrets/versions (default 200)
 #
 # deps: binwalk, unsquashfs/sasquatch, strings, openssl, file, find,
-#       grep, readelf, numfmt (optional: hashcat, python3)
+#       grep, readelf, numfmt (optional: modinfo, hashcat, python3)
 #
 # outputs:
 #   $OUTDIR/REPORT.md      human-readable per-category report
 #   $OUTDIR/findings.json  machine-readable taxonomy (category counts +
 #                          typed findings)
 #   $OUTDIR/findings/      copied artefacts under keys/certs/configs/
-#                          credentials/hashes
+#                          credentials/hashes/modules
 #   $OUTDIR/all_strings.txt
 #   $OUTDIR/items.tsv
+#   $OUTDIR/census.tsv
+#   $OUTDIR/kernel_modules.tsv
 #
 # All outputs are deterministic for a given input tree.
 
@@ -60,7 +62,7 @@ set -uo pipefail
 shopt -s nullglob
 
 declare -r SCRIPT_NAME="fw-extract.sh"
-declare -r VERSION="2.1.0"
+declare -r VERSION="2.2.0"
 
 HASH_WORDLIST="${HASH_WORDLIST:-}"
 HASH_TIMEOUT="${HASH_TIMEOUT:-3600}"
@@ -146,7 +148,7 @@ key_class() {
 
     marker=$(grep -am1 -E \
         'ENCRYPTED PRIVATE KEY|BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY|PuTTY-User-Key-File|^ssh-(rsa|dss|ed25519|ecdsa)|^ecdsa-|^sk-' \
-        "$f" 2>/dev/null)
+        "$f" 2>/dev/null | tr -d '\0')
 
     case "$marker" in
         *"PuTTY-User-Key-File"*)
@@ -228,6 +230,7 @@ stage1_extract() {
         application/gzip|application/x-gzip)
             mkdir -p "$EXTRACT/tar_contents"
             tar xzf "$FIRMWARE" -C "$EXTRACT/tar_contents" 2>/dev/null || \
+                (gunzip -c "$FIRMWARE" 2>/dev/null | tar xf - -C "$EXTRACT/tar_contents" 2>/dev/null) || \
                 gunzip -c "$FIRMWARE" > "$EXTRACT/decompressed" 2>/dev/null || true ;;
         application/x-tar)
             mkdir -p "$EXTRACT/tar_contents"
@@ -238,21 +241,58 @@ stage1_extract() {
             xz -dc "$FIRMWARE" > "$EXTRACT/decompressed" 2>/dev/null || true ;;
     esac
 
-    # unpack any squashfs/cpio images found inside
-    while IFS= read -r -d '' f; do
-        case "$(file -b "$f" 2>/dev/null)" in
-            *[Ss]quashfs*)
-                log "squashfs: ${f##*/}"
-                unsquashfs -d "$EXTRACT/squashfs_${f##*/}" -f "$f" 2>/dev/null || \
-                    sasquatch -d "$EXTRACT/squashfs_${f##*/}" -f "$f" 2>/dev/null || true
-                ;;
-            *cpio*)
-                log "cpio: ${f##*/}"
-                mkdir -p "$EXTRACT/cpio_${f##*/}"
-                (cd "$EXTRACT/cpio_${f##*/}" && cpio -idm < "$f" 2>/dev/null) || true
-                ;;
-        esac
-    done < <(find "$EXTRACT" -type f -print0 2>/dev/null)
+    # unpack nested archives (squashfs, cpio, tar/tgz, zip) recursively (up to 3 passes)
+    local pass new_archives ftype bname dest
+    local unpack_db="$OUTDIR/.unpacked"
+    : > "$unpack_db"
+    for pass in 1 2 3; do
+        new_archives=0
+        while IFS= read -r -d '' f; do
+            seen_db "$unpack_db" "$f" && continue
+            ftype=$(file -b "$f" 2>/dev/null || true)
+            bname="${f##*/}"
+            case "$ftype" in
+                *[Ss]quashfs*)
+                    dest="$EXTRACT/squashfs_${bname}"
+                    [[ -d "$dest" ]] && dest="${dest}_p${pass}"
+                    log "squashfs (pass $pass): $bname"
+                    unsquashfs -d "$dest" -f "$f" 2>/dev/null || \
+                        sasquatch -d "$dest" -f "$f" 2>/dev/null || true
+                    new_archives=1
+                    ;;
+                *cpio*)
+                    dest="$EXTRACT/cpio_${bname}"
+                    [[ -d "$dest" ]] && dest="${dest}_p${pass}"
+                    log "cpio (pass $pass): $bname"
+                    mkdir -p "$dest"
+                    (cd "$dest" && cpio -idm < "$f" 2>/dev/null) || true
+                    new_archives=1
+                    ;;
+                *gzip*|*POSIX\ tar*|*tar\ archive*|*XZ\ compressed*)
+                    if [[ "$f" == *.tgz || "$f" == *.tar.gz || "$f" == *.tar || "$f" == *.tar.xz || "$f" == *.txz ]]; then
+                        dest="$EXTRACT/tar_${bname}"
+                        [[ -d "$dest" ]] && dest="${dest}_p${pass}"
+                        log "tar archive (pass $pass): $bname"
+                        mkdir -p "$dest"
+                        tar xf "$f" -C "$dest" 2>/dev/null || \
+                            (gunzip -c "$f" 2>/dev/null | tar xf - -C "$dest" 2>/dev/null) || true
+                        new_archives=1
+                    fi
+                    ;;
+                *Zip\ archive*)
+                    if [[ "$f" == *.zip ]]; then
+                        dest="$EXTRACT/zip_${bname}"
+                        [[ -d "$dest" ]] && dest="${dest}_p${pass}"
+                        log "zip archive (pass $pass): $bname"
+                        mkdir -p "$dest"
+                        unzip -q -o "$f" -d "$dest" 2>/dev/null || true
+                        new_archives=1
+                    fi
+                    ;;
+            esac
+        done < <(find "$EXTRACT" -type f -print0 2>/dev/null)
+        [[ "$new_archives" -eq 0 ]] && break
+    done
 
     ROOTFS="$EXTRACT"
     FILE_COUNT=$(find "$ROOTFS" -type f 2>/dev/null | wc -l | tr -d ' ')
@@ -317,17 +357,45 @@ stage2_ssh_keys() {
     done < <(find "$ROOTFS" -type f \( -name "*.pub" -o -name "authorized_keys" \
         -o -name "authorized_keys2" \) -print0 2>/dev/null)
 
-    # sshd_config
+    # sshd_config and secondary ssh configurations
     while IFS= read -r -d '' kf; do
         seen "$kf" && continue
-        rpt "" "### sshd_config" '```'
+        local rel="${kf#"$ROOTFS/"}"
+        rpt "" "### SSH server config: \`$rel\`" '```'
         grep -vE '^\s*#|^\s*$' "$kf" >> "$REPORT" 2>/dev/null || true
         rpt '```' ""
-        grep -qi "PermitRootLogin.*yes" "$kf" 2>/dev/null && rpt "- PermitRootLogin yes"
-        grep -qi "StrictHostKeyChecking.*no" "$kf" 2>/dev/null && \
+
+        local p_root p_pass p_empty p_port p_authkey p_pub
+        p_root=$(grep -iE '^\s*PermitRootLogin\s+' "$kf" 2>/dev/null | head -1)
+        p_pass=$(grep -iE '^\s*PasswordAuthentication\s+' "$kf" 2>/dev/null | head -1)
+        p_empty=$(grep -iE '^\s*PermitEmptyPasswords\s+' "$kf" 2>/dev/null | head -1)
+        p_port=$(grep -iE '^\s*Port\s+' "$kf" 2>/dev/null | head -1)
+        p_authkey=$(grep -iE '^\s*AuthorizedKeysFile\s+' "$kf" 2>/dev/null | head -1)
+        p_pub=$(grep -iE '^\s*PubkeyAuthentication\s+' "$kf" 2>/dev/null | head -1)
+
+        [[ -n "$p_port" ]] && rpt "- $p_port"
+        [[ -n "$p_root" ]] && rpt "- $p_root"
+        [[ -n "$p_pass" ]] && rpt "- $p_pass"
+        [[ -n "$p_empty" ]] && rpt "- $p_empty"
+        [[ -n "$p_pub" ]] && rpt "- $p_pub"
+        [[ -n "$p_authkey" ]] && rpt "- $p_authkey"
+
+        if [[ "$p_authkey" =~ /tmp/|/var/tmp/ ]]; then
+            rpt "  - **HIGH RISK**: AuthorizedKeysFile points to writable temp path: $p_authkey"
+            note "ssh_config" high "$kf" "insecure AuthorizedKeysFile in temp path: $p_authkey"
+        fi
+        if grep -qiE 'PermitRootLogin\s+yes' "$kf" 2>/dev/null; then
+            note "ssh_config" high "$kf" "PermitRootLogin yes"
+        fi
+        if grep -qiE 'PermitEmptyPasswords\s+yes' "$kf" 2>/dev/null; then
+            note "ssh_config" high "$kf" "PermitEmptyPasswords yes"
+        fi
+        if grep -qi "StrictHostKeyChecking.*no" "$kf" 2>/dev/null; then
             rpt "- StrictHostKeyChecking no"
+            note "ssh_config" medium "$kf" "StrictHostKeyChecking no"
+        fi
         copy_finding "configs" "$kf"
-    done < <(find "$ROOTFS" -type f -name "sshd_config" -print0 2>/dev/null)
+    done < <(find "$ROOTFS" -type f \( -name "sshd_config*" -o -name "ssh_config*" \) -print0 2>/dev/null)
 }
 
 # ---------------------------------------------------------------------------
@@ -336,23 +404,50 @@ stage2_ssh_keys() {
 
 stage2_certs() {
     local cert info subj issuer is_ca f
+    local not_after sig_alg key_size
     section "Certificates"
 
     while IFS= read -r -d '' cert; do
         seen "$cert" && continue
         copy_finding "certs" "$cert"
-        info=$(openssl x509 -in "$cert" -text -noout 2>/dev/null | head -20) || \
-        info=$(openssl x509 -in "$cert" -inform DER -text -noout 2>/dev/null | head -20) || \
+        info=$(openssl x509 -in "$cert" -text -noout 2>/dev/null) || \
+        info=$(openssl x509 -in "$cert" -inform DER -text -noout 2>/dev/null) || \
         info=""
         if [[ -n "$info" ]]; then
-            subj=$(printf '%s\n' "$info" | grep "Subject:" | sed 's/.*Subject: //')
-            issuer=$(printf '%s\n' "$info" | grep "Issuer:" | sed 's/.*Issuer: //')
+            subj=$(printf '%s\n' "$info" | grep "Subject:" | head -1 | sed 's/.*Subject:\s*//')
+            issuer=$(printf '%s\n' "$info" | grep "Issuer:" | head -1 | sed 's/.*Issuer:\s*//')
             is_ca=$(printf '%s\n' "$info" | grep -c "CA:TRUE" 2>/dev/null || true)
             is_ca=${is_ca:-0}
+            not_after=$(printf '%s\n' "$info" | grep "Not After" | head -1 | sed 's/.*Not After\s*:\s*//')
+            sig_alg=$(printf '%s\n' "$info" | grep -m1 "Signature Algorithm" | sed 's/.*Signature Algorithm:\s*//')
+            key_size=$(printf '%s\n' "$info" | grep -oE 'Public-Key: \([0-9]+ bit\)' | head -1 | grep -oE '[0-9]+')
+
             rpt "- \`${cert##*/}\`: $subj"
             [[ "$is_ca" -gt 0 ]] && rpt "  - CA certificate"
             rpt "  - issuer: $issuer"
-            note "cert" info "$cert" "subject=$subj"
+            [[ -n "$not_after" ]] && rpt "  - expires: $not_after"
+            [[ -n "$sig_alg" ]] && rpt "  - algorithm: $sig_alg"
+            [[ -n "$key_size" ]] && rpt "  - public key: $key_size-bit"
+
+            if ! openssl x509 -in "$cert" -checkend 0 -noout 2>/dev/null; then
+                rpt "  - **EXPIRED**: certificate expired ($not_after)"
+                note "cert" medium "$cert" "certificate expired on $not_after"
+                N_EXPIRED_CERTS=$((N_EXPIRED_CERTS + 1))
+            fi
+            if [[ "$sig_alg" =~ (md5|sha1|MD5|SHA1) ]]; then
+                rpt "  - **WEAK ALGORITHM**: uses deprecated hash algorithm ($sig_alg)"
+                note "weak_crypto" high "$cert" "deprecated cert signature algorithm: $sig_alg"
+                N_WEAK_CERTS=$((N_WEAK_CERTS + 1))
+            fi
+            if [[ -n "$key_size" && "$key_size" -lt 2048 ]]; then
+                rpt "  - **WEAK KEY**: RSA key size < 2048 ($key_size-bit)"
+                note "weak_crypto" high "$cert" "weak certificate public key size ($key_size-bit < 2048)"
+                N_WEAK_CERTS=$((N_WEAK_CERTS + 1))
+            fi
+            if [[ "$subj" == "$issuer" ]]; then
+                rpt "  - self-signed certificate"
+            fi
+            note "cert" info "$cert" "subject=$subj; expires=$not_after"
         else
             rpt "- \`${cert##*/}\` (unparseable)"
             note "cert" low "$cert" "unparseable"
@@ -362,6 +457,25 @@ stage2_certs() {
         -name "*.jks" -o -name "*.keystore" -o -name "ca-bundle*" -o -name "*.ca" \
         \) -print0 2>/dev/null)
 
+    # Diffie-Hellman parameters check
+    while IFS= read -r -d '' f; do
+        seen "$f" && continue
+        copy_finding "keys" "$f"
+        local dh_info dh_bits
+        dh_info=$(openssl dhparam -in "$f" -text -noout 2>/dev/null || true)
+        dh_bits=$(printf '%s\n' "$dh_info" | grep -oE 'DH Parameters: \([0-9]+ bit\)' | grep -oE '[0-9]+' | head -1)
+        if [[ -n "$dh_bits" ]]; then
+            rpt "- DH parameter file: \`${f##*/}\` ($dh_bits-bit prime)"
+            if [[ "$dh_bits" -lt 2048 ]]; then
+                rpt "  - **WEAK DH PARAMETERS**: DH prime < 2048 ($dh_bits-bit, vulnerable to Logjam)"
+                note "weak_crypto" high "$f" "weak Diffie-Hellman prime length: $dh_bits bit (< 2048)"
+                N_WEAK_CERTS=$((N_WEAK_CERTS + 1))
+            else
+                note "crypto" info "$f" "Diffie-Hellman parameters: $dh_bits bit"
+            fi
+        fi
+    done < <(find "$ROOTFS" -type f \( -name "*dhpar*.pem" -o -name "*dhparam*.pem" -o -name "*.dh" \) -print0 2>/dev/null)
+
     while IFS= read -r -d '' f; do
         seen "$f" && continue
         copy_finding "configs" "$f"
@@ -370,6 +484,76 @@ stage2_certs() {
         note "key" low "$f" "ipsec secrets/config"
     done < <(find "$ROOTFS" -type f \( -name "ipsec.secrets" -o -name "ipsec.conf" \
         -o -name "*.secrets" -o -path "*/ipsec.d/*" \) -print0 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# stage 2 : dedicated secret files and credential stores
+# ---------------------------------------------------------------------------
+
+stage2_secret_files() {
+    local sf rel bname sz firstline
+    section "Dedicated Secret and Credential Files"
+
+    log "scanning for dedicated secret files..."
+    N_SECRET_FILES=0
+
+    # 1. Plaintext secret files in /etc or /var or across rootfs
+    while IFS= read -r -d '' sf; do
+        seen "$sf" && continue
+        is_text "$sf" || continue
+        sz=$(stat -c%s "$sf" 2>/dev/null || stat -f%z "$sf" 2>/dev/null || echo 0)
+        [[ "$sz" -eq 0 ]] && continue
+        bname="${sf##*/}"
+        rel="${sf#"$ROOTFS/"}"
+        copy_finding "credentials" "$sf"
+        N_SECRET_FILES=$((N_SECRET_FILES + 1))
+        firstline=$(grep -vE '^\s*#|^\s*$' "$sf" 2>/dev/null | head -1)
+        rpt "- **Secret file:** \`$rel\` ($sz bytes)"
+        [[ -n "$firstline" ]] && rpt "  - sample: \`${firstline:0:80}\`"
+        note "secret_file" high "$sf" "plaintext secret store: $bname"
+    done < <(find "$ROOTFS" -type f \( -name "*.secret" -o -name "*.secrets" -o \
+        -name "*eap.secret*" -o -name "*pap-secrets*" -o -name "*chap-secrets*" -o \
+        -name ".netrc" -o -name ".htpasswd" -o -name ".pgpass" -o \
+        -name "shadow.dir" -o -name "shadow.field" \) -print0 2>/dev/null)
+
+    # 2. Wireless / Wi-Fi credentials
+    while IFS= read -r -d '' sf; do
+        seen "$sf" && continue
+        is_text "$sf" || continue
+        rel="${sf#"$ROOTFS/"}"
+        copy_finding "configs" "$sf"
+        local psk ssid
+        psk=$(grep -iE 'psk\s*=' "$sf" 2>/dev/null | head -1)
+        ssid=$(grep -iE 'ssid\s*=' "$sf" 2>/dev/null | head -1)
+        rpt "- **Wireless config:** \`$rel\`"
+        [[ -n "$ssid" ]] && rpt "  - $ssid"
+        if [[ -n "$psk" ]]; then
+            rpt "  - $psk"
+            note "wireless_credential" high "$sf" "Wi-Fi PSK configured: ${psk:0:60}"
+            N_SECRET_FILES=$((N_SECRET_FILES + 1))
+        fi
+    done < <(find "$ROOTFS" -type f \( -name "wpa_supplicant*.conf" -o \
+        -name "hostapd*.conf" -o -name "wireless" -path "*/config/wireless" \) -print0 2>/dev/null)
+
+    # 3. Radius server / secret configs
+    while IFS= read -r -d '' sf; do
+        seen "$sf" && continue
+        is_text "$sf" || continue
+        rel="${sf#"$ROOTFS/"}"
+        copy_finding "configs" "$sf"
+        rpt "- **RADIUS config:** \`$rel\`"
+        local rline
+        rline=$(grep -vE '^\s*#|^\s*$' "$sf" 2>/dev/null | head -2)
+        [[ -n "$rline" ]] && rpt '```' "$rline" '```'
+        if grep -qiE 'secret|shared_secret' "$sf" 2>/dev/null; then
+            note "radius_config" medium "$sf" "RADIUS client/server configuration"
+            N_SECRET_FILES=$((N_SECRET_FILES + 1))
+        fi
+    done < <(find "$ROOTFS" -type f \( -path "*/raddb/*" -o -name "pam_radius*.conf" \) -print0 2>/dev/null)
+
+    rpt ""
+    rpt "- dedicated secret and credential files found: $N_SECRET_FILES"
+    rpt ""
 }
 
 # ---------------------------------------------------------------------------
@@ -568,6 +752,11 @@ stage2_creds() {
         ["url_creds"]='https?://[^/\s]*:([\w]+)@'
         ["snmp_community"]='[Ss][Nn][Mm][Pp](\s+|_|-)[Cc]ommunity\s*[:=]\s*["\x27]?[^\s"'\'']{4,}'
         ["mgmt_server_password"]='MANAGEMENT_SERVER_PASSWORD\s*[:=]'
+        ["google_api_keys"]='AIza[0-9A-Za-z_\-]{35}'
+        ["jwt_tokens"]='eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'
+        ["wireguard_keys"]='PrivateKey\s*=\s*[A-Za-z0-9+/]{43}='
+        ["github_tokens"]='gh[pousr]_[A-Za-z0-9_]{36,}'
+        ["private_key_headers"]='BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY'
     )
 
     for name in $(printf '%s\n' "${!PATTERNS[@]}" | sort); do
@@ -648,6 +837,110 @@ stage2_network() {
         rpt '```' ""
     done < <(find "$ROOTFS" -type f \( -name "iptables*" -o -name "nftables*" -o \
         -name "firewall*" -o -name "*.rules" -path "*/iptables/*" \) -print0 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# stage 2 : super-server and network services (xinetd / inetd)
+# ---------------------------------------------------------------------------
+
+stage2_services() {
+    local sc rel svc srv sargs usr grp iface port stype
+    section "Super-Server and Network Services"
+
+    log "enumerating super-server configurations (xinetd/inetd)..."
+    N_SERVICES=0
+
+    # xinetd services
+    while IFS= read -r -d '' sc; do
+        seen "$sc" && continue
+        is_text "$sc" || continue
+        rel="${sc#"$ROOTFS/"}"
+        copy_finding "configs" "$sc"
+
+        svc=$(grep -oE 'service\s+[A-Za-z0-9_-]+' "$sc" 2>/dev/null | awk '{print $2}' | head -1)
+        [[ -z "$svc" ]] && svc="${sc##*/}"
+        srv=$(grep -E 'server\s*=' "$sc" 2>/dev/null | sed 's/.*server\s*=\s*//' | tr -d ' \t' | head -1)
+        sargs=$(grep -E 'server_args\s*=' "$sc" 2>/dev/null | sed 's/.*server_args\s*=\s*//' | head -1)
+        usr=$(grep -E 'user\s*=' "$sc" 2>/dev/null | sed 's/.*user\s*=\s*//' | tr -d ' \t' | head -1)
+        grp=$(grep -E 'group\s*=' "$sc" 2>/dev/null | sed 's/.*group\s*=\s*//' | tr -d ' \t' | head -1)
+        iface=$(grep -E 'interface\s*=' "$sc" 2>/dev/null | sed 's/.*interface\s*=\s*//' | tr -d ' \t' | head -1)
+        port=$(grep -E 'port\s*=' "$sc" 2>/dev/null | sed 's/.*port\s*=\s*//' | tr -d ' \t' | head -1)
+        stype=$(grep -E 'socket_type\s*=' "$sc" 2>/dev/null | sed 's/.*socket_type\s*=\s*//' | tr -d ' \t' | head -1)
+
+        N_SERVICES=$((N_SERVICES + 1))
+        rpt "### Service: \`$svc\` (xinetd)"
+        rpt "- config: \`$rel\`"
+        [[ -n "$srv" ]] && rpt "- server: \`$srv\` ${sargs:+($sargs)}"
+        [[ -n "$usr" ]] && rpt "- user/group: \`$usr\` / \`${grp:-unknown}\`"
+        [[ -n "$iface" ]] && rpt "- interface: \`$iface\`"
+        [[ -n "$port" ]] && rpt "- port: \`$port\` ($stype)"
+
+        # Check for dangerous patterns in the target server script/binary
+        local sev="medium"
+        local srv_full="$ROOTFS/$srv"
+        if [[ -f "$srv_full" ]] && grep -qE 'eval\b|exec\b|/bin/sh|/bin/bash' "$srv_full" 2>/dev/null; then
+            sev="high"
+            rpt "  - **WARNING**: server script utilizes dynamic command execution (eval/exec)"
+        fi
+        if [[ "$usr" == "root" ]]; then
+            note "network_service" "$sev" "$sc" "xinetd service '$svc' runs as root: $srv"
+        else
+            note "network_service" "low" "$sc" "xinetd service '$svc' ($usr): $srv"
+        fi
+        rpt ""
+    done < <(find "$ROOTFS" -type f \( -path "*/xinetd.d/*" -o -name "xinetd.conf" \) -print0 2>/dev/null)
+
+    # inetd services
+    while IFS= read -r -d '' sc; do
+        seen "$sc" && continue
+        is_text "$sc" || continue
+        rel="${sc#"$ROOTFS/"}"
+        copy_finding "configs" "$sc"
+        rpt "### inetd config: \`$rel\`" '```'
+        grep -vE '^\s*#|^\s*$' "$sc" >> "$REPORT" 2>/dev/null || true
+        rpt '```' ""
+        note "network_service" medium "$sc" "inetd configuration active"
+        N_SERVICES=$((N_SERVICES + 1))
+    done < <(find "$ROOTFS" -type f -name "inetd.conf" -print0 2>/dev/null)
+
+    rpt "- total network/super-server services enumerated: $N_SERVICES"
+    rpt ""
+}
+
+# ---------------------------------------------------------------------------
+# stage 2 : scheduled tasks and background automation
+# ---------------------------------------------------------------------------
+
+stage2_scheduled() {
+    local cr rel line
+    section "Scheduled Tasks and Background Jobs"
+
+    log "auditing scheduled cron jobs and timers..."
+    N_CRON=0
+
+    while IFS= read -r -d '' cr; do
+        seen "$cr" && continue
+        is_text "$cr" || continue
+        rel="${cr#"$ROOTFS/"}"
+        local active_lines
+        active_lines=$(grep -vE '^\s*#|^\s*$' "$cr" 2>/dev/null || true)
+        [[ -z "$active_lines" ]] && continue
+
+        copy_finding "configs" "$cr"
+        rpt "### crontab: \`$rel\`" '```'
+        printf '%s\n' "$active_lines" >> "$REPORT"
+        rpt '```' ""
+
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            N_CRON=$((N_CRON + 1))
+            note "scheduled_task" medium "$cr" "cron job: ${line:0:100}"
+        done <<< "$active_lines"
+    done < <(find "$ROOTFS" -type f \( -name "crontab" -o -path "*/cron.*/*" -o \
+        -path "*/crontabs/*" -o -name "*.timer" \) -print0 2>/dev/null)
+
+    rpt "- scheduled task definitions found: $N_CRON"
+    rpt ""
 }
 
 # ---------------------------------------------------------------------------
@@ -935,11 +1228,179 @@ stage5_binary_insight() {
 }
 
 # ---------------------------------------------------------------------------
+# stage 5 : privilege and permissions audit (SUID / SGID / world-writable)
+# ---------------------------------------------------------------------------
+
+stage_permissions() {
+    local sf rel mode sz user group perm_str bname
+    local is_suid is_sgid
+    section "Privilege and Permissions Audit"
+
+    log "auditing SUID/SGID binaries and world-writable files..."
+    N_SUID=0; N_SGID=0; N_WW=0; N_SUID_WEAK=0
+
+    local perm_db="$OUTDIR/.seen_perms"
+    : > "$perm_db"
+
+    rpt "### SUID and SGID Binaries"
+    rpt ""
+    rpt "| permissions | user:group | size | binary | risk flags |"
+    rpt "|-------------|------------|------|--------|------------|"
+
+    while IFS= read -r -d '' sf; do
+        seen_db "$perm_db" "$sf" && continue
+        mode=$(stat -c%a "$sf" 2>/dev/null || stat -f%Lp "$sf" 2>/dev/null || echo 0)
+        perm_str=$(stat -c%A "$sf" 2>/dev/null || stat -f%Sp "$sf" 2>/dev/null || echo "")
+        user=$(stat -c%U "$sf" 2>/dev/null || stat -f%Su "$sf" 2>/dev/null || echo "unknown")
+        group=$(stat -c%G "$sf" 2>/dev/null || stat -f%Sg "$sf" 2>/dev/null || echo "unknown")
+        sz=$(stat -c%s "$sf" 2>/dev/null || stat -f%z "$sf" 2>/dev/null || echo 0)
+        rel="${sf#"$ROOTFS/"}"
+        bname="${sf##*/}"
+
+        is_suid=0; is_sgid=0
+        [[ "$mode" =~ ^[4-7]...$ ]] && is_suid=1
+        [[ "$mode" =~ ^[2367]...$ ]] && is_sgid=1
+
+        [[ "$is_suid" -eq 1 ]] && N_SUID=$((N_SUID + 1))
+        [[ "$is_sgid" -eq 1 ]] && N_SGID=$((N_SGID + 1))
+
+        # Check ELF hardening on SUID binary
+        local risk=""
+        if file -b "$sf" 2>/dev/null | grep -q "ELF"; then
+            local hdr ph
+            hdr=$(readelf -h "$sf" 2>/dev/null)
+            ph=$(readelf -l "$sf" 2>/dev/null)
+            readelf -s "$sf" 2>/dev/null | grep -q "__stack_chk_fail" || risk+="NO_CANARY "
+            printf '%s\n' "$hdr" | grep -q "DYN" || risk+="NO_PIE "
+            printf '%s\n' "$ph" | grep -qE "GNU_STACK.* RW " || risk+="EXEC_STACK "
+            if [[ -n "$risk" ]]; then
+                N_SUID_WEAK=$((N_SUID_WEAK + 1))
+            fi
+        fi
+
+        case "$bname" in
+            busybox|su|sh|bash|dash|python*|perl|awk|find|tar|chmod|chown)
+                risk+="CRITICAL_BIN "
+                note "suid_root" high "$sf" "high-risk SUID binary: $bname ($perm_str) [${risk:-HARDENED}]"
+                ;;
+            *)
+                if [[ -n "$risk" ]]; then
+                    note "suid_root" high "$sf" "SUID binary lacking hardening: $bname ($risk)"
+                else
+                    note "suid_root" medium "$sf" "SUID binary: $bname ($perm_str)"
+                fi
+                ;;
+        esac
+
+        rpt "| \`$perm_str\` | \`$user:$group\` | $sz | \`$rel\` | **${risk:-clean}** |"
+    done < <(find "$ROOTFS" -type f \( -perm -4000 -o -perm -2000 \) -print0 2>/dev/null)
+
+    rpt ""
+    rpt "- SUID binaries: $N_SUID"
+    rpt "- SGID binaries: $N_SGID"
+    rpt "- SUID binaries missing hardening: $N_SUID_WEAK"
+    rpt ""
+
+    # World-writable files in system paths
+    rpt "### World-Writable Files in System Paths"
+    rpt ""
+    while IFS= read -r -d '' sf; do
+        [[ -L "$sf" ]] && continue
+        seen "$sf" && continue
+        rel="${sf#"$ROOTFS/"}"
+        perm_str=$(stat -c%A "$sf" 2>/dev/null || stat -f%Sp "$sf" 2>/dev/null || echo "")
+        user=$(stat -c%U "$sf" 2>/dev/null || stat -f%Su "$sf" 2>/dev/null || echo "unknown")
+        N_WW=$((N_WW + 1))
+        rpt "- \`$rel\` ($perm_str, owner: $user)"
+        note "world_writable" high "$sf" "world-writable file: $perm_str"
+    done < <(find "$ROOTFS" -type f -perm -0002 \( -path "*/etc/*" -o -path "*/usr/*" \
+        -o -path "*/bin/*" -o -path "*/sbin/*" -o -path "*/lib/*" -o -path "*/opt/*" \) \
+        -print0 2>/dev/null | head -z -n 50)
+
+    rpt ""
+    rpt "- world-writable files in system paths: $N_WW"
+    rpt ""
+}
+
+# ---------------------------------------------------------------------------
+# stage 5 : kernel modules and driver security census
+# ---------------------------------------------------------------------------
+
+stage_kernel_modules() {
+    local ko rel bname info author desc lic vmagic parms deps
+    local kmod_tsv="$OUTDIR/kernel_modules.tsv"
+    section "Kernel Modules and Drivers"
+
+    log "cataloging kernel modules (.ko)..."
+    N_KMOD=0; N_KMOD_PROP=0
+    : > "$kmod_tsv"
+
+    local kmod_db="$OUTDIR/.seen_kmod"
+    : > "$kmod_db"
+
+    rpt "| module | license | vermagic | author / description | parameters |"
+    rpt "|--------|---------|----------|----------------------|------------|"
+
+    while IFS= read -r -d '' ko; do
+        seen_db "$kmod_db" "$ko" && continue
+        bname="${ko##*/}"
+        rel="${ko#"$ROOTFS/"}"
+        N_KMOD=$((N_KMOD + 1))
+
+        author=""; desc=""; lic=""; vmagic=""; parms=""; deps=""
+        if have modinfo; then
+            info=$(modinfo "$ko" 2>/dev/null || true)
+            author=$(printf '%s\n' "$info" | grep -m1 '^author:' | sed 's/^author:\s*//' | tr -d '\t\r\n')
+            desc=$(printf '%s\n' "$info" | grep -m1 '^description:' | sed 's/^description:\s*//' | tr -d '\t\r\n')
+            lic=$(printf '%s\n' "$info" | grep -m1 '^license:' | sed 's/^license:\s*//' | tr -d '\t\r\n')
+            vmagic=$(printf '%s\n' "$info" | grep -m1 '^vermagic:' | sed 's/^vermagic:\s*//' | tr -d '\t\r\n')
+            deps=$(printf '%s\n' "$info" | grep -m1 '^depends:' | sed 's/^depends:\s*//' | tr -d '\t\r\n')
+            parms=$(printf '%s\n' "$info" | grep '^parm:' | sed 's/^parm:\s*//' | tr '\n' '; ' | sed 's/; $//')
+        fi
+        if [[ -z "$lic" ]]; then
+            local mstrs
+            mstrs=$(strings -a "$ko" 2>/dev/null | grep -E '^(license|author|description|vermagic|parm)=' || true)
+            lic=$(printf '%s\n' "$mstrs" | grep -m1 '^license=' | cut -d= -f2-)
+            author=$(printf '%s\n' "$mstrs" | grep -m1 '^author=' | cut -d= -f2-)
+            desc=$(printf '%s\n' "$mstrs" | grep -m1 '^description=' | cut -d= -f2-)
+            vmagic=$(printf '%s\n' "$mstrs" | grep -m1 '^vermagic=' | cut -d= -f2-)
+            parms=$(printf '%s\n' "$mstrs" | grep '^parm=' | cut -d= -f2- | tr '\n' '; ' | sed 's/; $//')
+        fi
+
+        lic="${lic:-unspecified}"
+        case "$lic" in
+            *GPL*|*BSD*|*MIT*|*Dual*) ;;
+            *)
+                N_KMOD_PROP=$((N_KMOD_PROP + 1))
+                lic="**PROPRIETARY** ($lic)"
+                ;;
+        esac
+
+        local auth_desc=""
+        [[ -n "$author" ]] && auth_desc+="$author"
+        if [[ -n "$desc" ]]; then
+            [[ -n "$auth_desc" ]] && auth_desc+=" - $desc" || auth_desc="$desc"
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$bname" "$lic" "${vmagic:0:50}" "${auth_desc:0:60}" "${parms:0:80}" "$rel" >> "$kmod_tsv"
+
+        rpt "| \`$bname\` | $lic | \`${vmagic:0:35}\` | ${auth_desc:0:45} | ${parms:0:50} |"
+        note "kernel_module" low "$ko" "driver $bname ($lic): $auth_desc"
+    done < <(find "$ROOTFS" -type f -name "*.ko" -print0 2>/dev/null | sort -z)
+
+    rpt ""
+    rpt "- total kernel modules (.ko) cataloged: $N_KMOD"
+    rpt "- proprietary / out-of-tree modules: $N_KMOD_PROP"
+    rpt ""
+}
+
+# ---------------------------------------------------------------------------
 # startup scripts
 # ---------------------------------------------------------------------------
 
 stage2_startup() {
-    local s cr
+    local s
     section "Startup Scripts"
 
     while IFS= read -r -d '' s; do
@@ -954,16 +1415,7 @@ stage2_startup() {
         fi
     done < <(find "$ROOTFS" -type f \( -path "*/init.d/*" -o -path "*/rc.d/*" -o \
         -path "*/systemd/system/*.service" -o -name "rc.local" -o -name "inittab" \
-        -o -name "crontab" -path "*/etc/*" \) -print0 2>/dev/null)
-
-    while IFS= read -r -d '' cr; do
-        is_text "$cr" || continue
-        seen "$cr" && continue
-        rpt "" "### crontab: ${cr##*/}" '```'
-        grep -vE '^\s*#|^\s*$' "$cr" >> "$REPORT" 2>/dev/null || true
-        rpt '```' ""
-    done < <(find "$ROOTFS" -type f \( -name "crontab" -o -path "*/cron.d/*" -o \
-        -path "*/cron.daily/*" -o -path "*/cron.hourly/*" \) -print0 2>/dev/null)
+        -path "*/etc/*" \) -print0 2>/dev/null)
     rpt ""
 }
 
@@ -1072,6 +1524,83 @@ stage5_web() {
     done < <(find "$ROOTFS" -type f \( -name "phpinfo*" -o -name "adminer*" -o \
         -name "phpmyadmin*" -o -name "info.php" -o -name "test.php" -o \
         -name "debug.php" \) -print0 2>/dev/null)
+    rpt ""
+}
+
+# ---------------------------------------------------------------------------
+# stage 5 : kernel and system security configuration (sysctl)
+# ---------------------------------------------------------------------------
+
+stage_sysctl() {
+    local sc rel
+    section "Kernel and Network Security Configuration (sysctl)"
+
+    log "auditing sysctl configurations..."
+    while IFS= read -r -d '' sc; do
+        seen "$sc" && continue
+        is_text "$sc" || continue
+        rel="${sc#"$ROOTFS/"}"
+        copy_finding "configs" "$sc"
+
+        rpt "### sysctl: \`$rel\`"
+        if grep -qi "LAB MODE" "$sc" 2>/dev/null; then
+            rpt "> [!WARNING]"
+            rpt "> Test / Lab mode configuration active in production image!"
+            note "test_artifact" medium "$sc" "sysctl file indicates LAB MODE ONLY"
+        fi
+        rpt '```'
+        grep -vE '^\s*#|^\s*$' "$sc" >> "$REPORT" 2>/dev/null || true
+        rpt '```' ""
+
+        if grep -qE 'net\.ipv4\.ip_forward\s*=\s*1' "$sc" 2>/dev/null; then
+            note "hardening" low "$sc" "IPv4 forwarding enabled (routing appliance)"
+        fi
+        if grep -qE 'kernel\.randomize_va_space\s*=\s*0' "$sc" 2>/dev/null; then
+            rpt "- **WARNING**: ASLR explicitly disabled (kernel.randomize_va_space = 0)"
+            note "hardening" high "$sc" "ASLR explicitly disabled (randomize_va_space = 0)"
+        fi
+    done < <(find "$ROOTFS" -type f \( -name "sysctl.conf" -o -name "sysctl_*.conf" \
+        -o -path "*/sysctl.d/*" \) -print0 2>/dev/null)
+    rpt ""
+}
+
+# ---------------------------------------------------------------------------
+# bootloader, flash storage partitions and hardware assets
+# ---------------------------------------------------------------------------
+
+stage_boot_hardware() {
+    local be rel fpg sz ftype
+    section "Bootloader, Storage Partitions and Hardware Assets"
+
+    log "inspecting bootloader environments and hardware blobs..."
+    N_FPGA=0
+
+    # U-Boot fw_env.config
+    while IFS= read -r -d '' be; do
+        seen "$be" && continue
+        is_text "$be" || continue
+        rel="${be#"$ROOTFS/"}"
+        copy_finding "configs" "$be"
+        rpt "### U-Boot Environment Layout (\`${be##*/}\`)" '```'
+        grep -vE '^\s*#|^\s*$' "$be" >> "$REPORT" 2>/dev/null || true
+        rpt '```' ""
+        note "boot_config" low "$be" "U-Boot flash environment configuration"
+    done < <(find "$ROOTFS" -type f \( -name "fw_env.config" -o -name "uEnv.txt" -o -name "boot.scr" \) -print0 2>/dev/null)
+
+    # Hardware blobs / FPGA bitstreams
+    while IFS= read -r -d '' fpg; do
+        seen "$fpg" && continue
+        rel="${fpg#"$ROOTFS/"}"
+        sz=$(stat -c%s "$fpg" 2>/dev/null || stat -f%z "$fpg" 2>/dev/null || echo 0)
+        ftype=$(file -b "$fpg" 2>/dev/null || echo "unknown")
+        N_FPGA=$((N_FPGA + 1))
+        copy_finding "configs" "$fpg"
+        rpt "- **Hardware blob / FPGA:** \`$rel\` ($sz bytes, $ftype)"
+        note "hardware_asset" info "$fpg" "FPGA/coprocessor image: ${fpg##*/}"
+    done < <(find "$ROOTFS" -type f \( -name "*.rbf" -o -name "*.bit" -o -name "*fpga*" \) -print0 2>/dev/null)
+
+    rpt ""
+    rpt "- hardware bitstreams/coprocessor blobs identified: $N_FPGA"
     rpt ""
 }
 
@@ -1222,6 +1751,17 @@ synthesize() {
 | ELF binaries with embedded secrets | ${N_BIN_SECRET:-0} |
 | ELF binaries with known component ver | ${N_BIN_VER:-0} |
 | debug consoles/services referenced | ${N_CONSOLE:-0} |
+| SUID binaries | ${N_SUID:-0} |
+| SGID binaries | ${N_SGID:-0} |
+| SUID binaries missing hardening | ${N_SUID_WEAK:-0} |
+| world-writable files (system paths) | ${N_WW:-0} |
+| kernel modules (.ko) cataloged | ${N_KMOD:-0} |
+| proprietary kernel modules | ${N_KMOD_PROP:-0} |
+| super-server/network services | ${N_SERVICES:-0} |
+| scheduled tasks (cron) | ${N_CRON:-0} |
+| dedicated secret files | ${N_SECRET_FILES:-0} |
+| weak/expired certificates | ${N_WEAK_CERTS:-0} |
+| hardware/FPGA blobs | ${N_FPGA:-0} |
 | extracted files | ${FILE_COUNT:-0} |
 | strings indexed | ${STR_COUNT:-0} |
 EOF
@@ -1235,6 +1775,7 @@ emit_json() {
     if have python3; then
         ITEMS="$ITEMS" REPORT="$REPORT" \
         FW_NAME="$FW_NAME" FW_SIZE="${FW_SIZE:-0}" OUTDIR="$OUTDIR" \
+        FW_VER="$VERSION" \
         python3 - "$OUTDIR/findings.json" <<'PY'
 import json, os, sys
 
@@ -1261,7 +1802,7 @@ if head != -1:
                 summary[cells[0]] = int(cells[1])
 
 doc = {
-    "tool": {"name": "fw-extract.sh", "version": "2.1.0"},
+    "tool": {"name": "fw-extract.sh", "version": os.environ.get("FW_VER", "2.2.0")},
     "firmware": {"file": os.environ.get("FW_NAME", ""),
                  "size_bytes": int(os.environ.get("FW_SIZE", "0") or 0)},
     "output_dir": os.environ.get("OUTDIR", ""),
@@ -1302,9 +1843,10 @@ main() {
     SEEN="$OUTDIR/.seen"
     CENSUS_TSV="$OUTDIR/census.tsv"
 
-    mkdir -p "$OUTDIR" "$EXTRACT" "$FINDINGS"/{keys,certs,configs,credentials,hashes}
+    mkdir -p "$OUTDIR" "$EXTRACT" "$FINDINGS"/{keys,certs,configs,credentials,hashes,modules}
     : > "$SEEN"
     : > "$ITEMS"
+    : > "$FINDINGS/hashes/crackable.txt"
 
     FW_SIZE=0
     if [[ -f "$FIRMWARE" ]]; then
@@ -1346,20 +1888,34 @@ EOF
     FILE_COUNT=0; STR_COUNT=0
     MIME="directory/scan-only"
 
+    # extended security counters
+    N_SUID=0; N_SGID=0; N_WW=0; N_SUID_WEAK=0
+    N_KMOD=0; N_KMOD_PROP=0
+    N_SERVICES=0; N_CRON=0; N_SECRET_FILES=0
+    N_WEAK_CERTS=0; N_EXPIRED_CERTS=0
+    N_FPGA=0
+
     t_start=$(date +%s)
 
     stage1_extract
     stage2_ssh_keys
     stage2_certs
+    stage2_secret_files
     stage2_accounts
     stage4_hashcat
     stage2_creds
     stage2_network
+    stage2_services
+    stage2_scheduled
     stage5_binaries
     stage5_binary_insight
+    stage_permissions
+    stage_kernel_modules
     stage2_startup
     stage6_debug
     stage5_web
+    stage_sysctl
+    stage_boot_hardware
     stage_metadata
     stage3_crypto
     stage_interesting
@@ -1376,6 +1932,15 @@ EOF
         echo " hashes cracked           : ${HASH_CRACKED}"
         echo " ELF binaries analysed    : ${N_ELF}"
         echo " ELF binaries missing hw  : ${N_WEAK}"
+        echo " SUID / SGID binaries     : ${N_SUID} / ${N_SGID}"
+        echo " SUID binaries missing hw : ${N_SUID_WEAK}"
+        echo " world-writable files     : ${N_WW}"
+        echo " kernel modules (.ko)     : ${N_KMOD} (${N_KMOD_PROP} proprietary)"
+        echo " network services (xinetd): ${N_SERVICES}"
+        echo " scheduled tasks (cron)   : ${N_CRON}"
+        echo " dedicated secret files   : ${N_SECRET_FILES}"
+        echo " weak/expired certs       : ${N_WEAK_CERTS}"
+        echo " hardware/FPGA blobs      : ${N_FPGA}"
         echo "------------------------------------------"
     } >> "$REPORT"
     log "analysis complete in $(human_time $((t_end - t_start))). see $REPORT"
