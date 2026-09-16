@@ -211,26 +211,6 @@ The pipeline was empirically validated on a production telecommunications firmwa
 | **Loadable Kernel Modules (.ko)** | 63 | 63 | **100%** | Driver inventory, vermagic, and parameters |
 | **Debug Consoles / Services** | 6 | 6 | **100%** | Telnet on localhost:3140 and localhost:7900 |
 
-#### Cross-Firmware Comparative Benchmark
-
-The pipeline was also evaluated across multiple distinct telecommunications firmware architectures in the testbed, contrasting the **Askey 9361 Femtocell** against the **SmartNode 532 Femtocell** (`532-256-V8.4n`):
-
-| Evaluation Metric | Alcatel-Lucent Askey 9361 (`BSR-04.03.70`) | SmartNode 532 (`532-256-V8.4n`) |
-|---|:---:|:---:|
-| **Firmware Archive Size** | 120 MB | 6.5 MB |
-| **Extracted Files Count** | 2,117 files | 131 files |
-| **Indexed String Tokens** | 1,236,616 strings | 286,965 strings |
-| **Plaintext Private Keys** | 2 (`dummy.key`, `id_dsa`) | 1 (`prikey.pem`) |
-| **Encrypted Private Keys** | 0 | 1 (embedded decompressed) |
-| **X.509 Certificates** | 1 (expired 2009, SHA-1) | 2 (expired easy-rsa `ca.crt`, `dhpars.pem`) |
-| **Crackable Hashes in Shadow** | 4 ($1$ MD5-crypt) | 0 |
-| **ELF Binaries Analysed** | 374 | 51 |
-| **Binaries Lacking Canaries** | 374 (100%) | 51 (100%) |
-| **Binaries with Unsafe C Imports** | 94 (25.1%) | 34 (66.7%) |
-| **Unstripped Binaries** | 6 (1.6%) | 43 (84.3%) |
-| **Hardware / FPGA Bitstream Blobs** | 0 | 4 (.rbf / coprocessor bitstreams) |
-| **Kernel Modules Cataloged** | 63 | 7 |
-
 ### Key Takeaways from the Pilot Study
 
 1. **100% Unencrypted Private Key Storage (RQ2):** Both private keys recovered from the production image (`dummy.key` and `id_dsa`) were stored in unencrypted plaintext. Any adversary with access to the published firmware possesses the private keys directly.
