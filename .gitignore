@@ -1,0 +1,35 @@
+# Firmware images and archives (>100MB exceeds GitHub limit)
+*.tgz
+*.tar.gz
+*.zip
+*.bin
+532-256-V8.4n
+BSR-04.03.70.a.2.aky.tgz
+
+# Wordlists (>100MB exceeds GitHub limit)
+rockyou.txt
+*.wordlist
+
+# Extraction directories and temporary analysis runs
+_*.extracted/
+extracted/
+analysis_*/
+asky-*/
+askey-*/
+fbsr/
+manual_extract/
+manual_extract.old/
+demo/
+demo2/
+out/
+out_*/
+GDF/
+
+# Backup and scratch files
+*.bak
+*.old
+*.sh.2
+*.v1.sh.bak
+.seen*
+.secret_rows
+.unpacked
