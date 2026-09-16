@@ -87,36 +87,7 @@ The pipeline is explicitly structured to provide quantitative answers to three c
 
 ### 7-Stage Analysis Flowchart
 
-```mermaid
-flowchart TD
-    A["Firmware Archive / Image (.tgz, .bin, .img)"] --> B["Stage 1: Multi-Partition & Archive Unpacking\n(binwalk recursive, unsquashfs, sasquatch, cpio, tar)"]
-    A_DIR["Pre-Extracted Filesystem Tree"] -->|Scan-Only Mode| C
-    B --> C["Cross-Partition Indexing\n(Generate unified all_strings.txt)"]
-
-    subgraph Surface Reconnaissance & Secrets
-        C --> D["Stage 2: Filesystem Reconnaissance\n• Accounts (/etc/passwd, UID 0 check)\n• Secret Files (pap/chap-secrets, .netrc, wpa_supplicant)\n• Network & Super-Servers (xinetd, inetd)\n• Scheduled Tasks (cron, systemd timers)\n• Regex Pass (API keys, JWT, WireGuard)"]
-    end
-
-    subgraph Cryptographic Hygiene
-        D --> E["Stage 3: Cryptographic Hygiene & Key Audit\n• OpenSSL Validation (Private vs Encrypted vs Public)\n• X.509 Certificate Expiry & Deprecated Hashes\n• RSA Key Length (<2048-bit) & DH Parameters"]
-    end
-
-    subgraph Offline Hash Cracking
-        E --> F["Stage 4: Password Hash Cracking Engine\n• Hash Format Auto-Detection ($1$, $5$, $6$, $2a$)\n• Time-Bounded Hashcat Dictionary Run (RockYou)\n• Per-Account Recovery Logging"]
-    end
-
-    subgraph Deep Binary Inspection
-        F --> G["Stage 5: ELF Binary Hardening & Unsafe Symbol Census\n• Exploit Mitigations (NX, PIE, Canary, RELRO, FORTIFY)\n• Unsafe C Function Imports (strcpy, system, sprintf, etc.)\n• Embedded Secrets & Component Version Fingerprinting"]
-    end
-
-    subgraph Debug & Backdoor Auditing
-        G --> H["Stage 6: Debug Interface & Service Enumeration\n• Telnet, Dropbear, GDBServer, Socat/Netcat\n• Exposure Classification (Loopback vs Network 0.0.0.0)\n• Serial Console & JTAG References"]
-    end
-
-    subgraph Synthesis & Taxonomy Construction
-        H --> I["Stage 7: Results Synthesis & Reporting\n• Human-Readable REPORT.md\n• Machine-Readable findings.json\n• TSV Metrics (census.tsv, kernel_modules.tsv, items.tsv)\n• Curated Artifact Copies (findings/ directory)"]
-    end
-```
+![7-Stage Static Analysis Research Design and Workflow](diagram.jpg)
 
 ### Stage Breakdown
 
@@ -480,6 +451,7 @@ This tool and the associated research strictly adhere to academic and industry e
 | [`fw-extract.v1.sh`](fw-extract.v1.sh) | Legacy v1.0 prototype script retained for historical reference and diff analysis. |
 | [`Final_STEM_Rahman_v12.pdf`](Final_STEM_Rahman_v12.pdf) | Academic research report submitted for Master of Cyber Security and Digital Forensics at AUT. |
 | [`Final_STEM_Rahman_v12.docx`](Final_STEM_Rahman_v12.docx) | Word source document of the research report. |
+| [`diagram.jpg`](diagram.jpg) | 7-stage static analysis research design and pipeline architecture diagram. |
 | `BSR-04.03.70.a.2.aky.tgz` | Reference firmware image: Alcatel-Lucent Askey 9361 3G Femtocell (~120 MB; local benchmark image). |
 | `analysis_bsr/` | Benchmark analysis results, TSVs, and reports for the Askey 9361 firmware. |
 | [`hashes_only.txt`](hashes_only.txt) | Extracted password hashes benchmark file. |
