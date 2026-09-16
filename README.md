@@ -13,20 +13,6 @@ Developed at **Auckland University of Technology (AUT)** as the operational tool
 
 ---
 
-> ### GitHub "About" Section Metadata (for Repository Settings)
->
-> When configuring this repository's GitHub sidebar settings (**About** gear icon on the main repo page), use the following metadata:
->
-> - **Description**:
->   `Automated static-analysis pipeline for embedded Linux firmware. Systematically extracts and audits credentials, cryptographic keys, password hashes, ELF binary hardening, unsafe C functions, and debug interfaces.`
-> - **Website / Reference**:
->   `https://github.com/<username>/<repo>` *(or link to the research paper PDF)*
-> - **Include in home page**: Releases, Packages, Environments
-> - **Topics / Tags**:
->   `firmware-analysis` &nbsp; `static-analysis` &nbsp; `embedded-linux` &nbsp; `iot-security` &nbsp; `reverse-engineering` &nbsp; `binary-analysis` &nbsp; `firmware-extraction` &nbsp; `cryptographic-hygiene` &nbsp; `telecom-security` &nbsp; `femtocell` &nbsp; `hashcat` &nbsp; `binwalk` &nbsp; `mips` &nbsp; `arm64` &nbsp; `cybersecurity-research`
-
----
-
 ## Table of Contents
 
 - [About The Project](#about-the-project)
